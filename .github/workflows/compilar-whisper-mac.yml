@@ -1,1 +1,93 @@
-# temporal
+# Receta para GitHub Actions: arma el programa whisper-cli para Mac (chip Apple e Intel) en computadores
+# Mac de GitHub, lo prueba transcribiendo un audio de ejemplo y lo publica en «Releases» con su huella SHA-256.
+# Se copia en el repositorio de herramientas como: .github/workflows/compilar-whisper-mac.yml
+# Escrito desde cero para «Crea Videos con Claude» (fase 5.8). whisper.cpp tiene licencia MIT.
+
+name: Compilar whisper para Mac
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Versión de whisper.cpp (la misma que usa Windows)'
+        required: true
+        default: 'b5454'
+
+permissions:
+  contents: write # para publicar el resultado en «Releases»
+
+jobs:
+  compilar:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arq: arm64
+            computador: macos-15 # Mac con chip Apple
+            metal: 'ON' # usa la tarjeta gráfica del Mac (mucho más rápido)
+          - arq: x64
+            computador: macos-15-intel # Mac Intel (si GitHub le cambia el nombre, cambiarlo aquí)
+            metal: 'OFF'
+    runs-on: ${{ matrix.computador }}
+    steps:
+      - name: Bajar whisper.cpp (versión fija)
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/whisper.cpp
+          ref: ${{ inputs.version }}
+
+      - name: Compilar (un solo archivo, sin librerías aparte)
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_BLAS=OFF \
+            -DGGML_METAL=${{ matrix.metal }} \
+            -DGGML_METAL_EMBED_LIBRARY=ON
+          cmake --build build --config Release -j 4 --target whisper-cli
+          ls -la build/bin
+
+      - name: Revisar que no dependa de nada raro
+        run: |
+          file build/bin/whisper-cli
+          otool -L build/bin/whisper-cli
+
+      - name: Probar de verdad (transcribir el audio de ejemplo con un modelo chico)
+        run: |
+          curl -L --fail -o tiny.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin
+          ./build/bin/whisper-cli -m tiny.bin -f samples/jfk.wav -l en -ojf -of prueba -np
+          grep -i "ask not" prueba.json
+
+      - name: Empaquetar con huella
+        run: |
+          mkdir paquete
+          cp build/bin/whisper-cli paquete/
+          cp LICENSE paquete/LICENCIA-whisper.cpp.txt
+          codesign --force --sign - paquete/whisper-cli
+          cd paquete && zip -r "../whisper-cli-mac-${{ matrix.arq }}.zip" . && cd ..
+          shasum -a 256 "whisper-cli-mac-${{ matrix.arq }}.zip" | tee "whisper-cli-mac-${{ matrix.arq }}.zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whisper-mac-${{ matrix.arq }}
+          path: whisper-cli-mac-${{ matrix.arq }}.zip*
+
+  publicar:
+    needs: compilar
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Publicar en Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la
+          gh release create "whisper-${{ inputs.version }}" whisper-cli-mac-* \
+            --repo "${{ github.repository }}" \
+            --title "whisper-cli ${{ inputs.version }} para Mac" \
+            --notes "whisper.cpp ${{ inputs.version }} (licencia MIT, incluida en el zip). Armado y probado por GitHub Actions en macOS (chip Apple e Intel). Huellas SHA-256 en los archivos .sha256."
